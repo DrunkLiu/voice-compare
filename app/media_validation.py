@@ -50,6 +50,7 @@ def validate_media_file(path: str | Path, probe: str | None = None) -> None:
             capture_output=True,
             text=True,
             timeout=15,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise MediaValidationError(
@@ -65,7 +66,7 @@ def validate_media_file(path: str | Path, probe: str | None = None) -> None:
     except json.JSONDecodeError as exc:
         raise MediaValidationError("文件无法被识别为有效的音频或视频") from exc
 
-    # 至少要有音频流或视频流，纯文本等无效文件会在这里被拦截
+    # 发音对比必须依赖音频，纯视频流（无声视频）在这里直接拦截
     streams = data.get("streams", [])
-    if not any(stream.get("codec_type") in ("audio", "video") for stream in streams):
-        raise MediaValidationError("文件中没有可用的音频或视频流")
+    if not any(stream.get("codec_type") == "audio" for stream in streams):
+        raise MediaValidationError("文件中没有可用的音频流，请上传带声音的音频或视频")

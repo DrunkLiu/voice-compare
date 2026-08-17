@@ -3,12 +3,13 @@
 import logging
 import re
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,14 +19,39 @@ from app.media_validation import (
     is_image_bytes,
     validate_media_file,
 )
-from app.storage import insert_file, list_files as list_stored_files
+from app.storage import get_file, init_db, insert_file
+from app.storage import list_files as list_stored_files
+from app.transcriber import transcribe_audio
 
 settings = get_settings()
+
+
+def _setup_logging() -> None:
+    """配置控制台日志和滚动文件日志，文件最大 5MB，保留 3 份。"""
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    handlers = [logging.StreamHandler()]
+    try:
+        file_handler = RotatingFileHandler(
+            log_dir / "app.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handlers.append(file_handler)
+    except OSError:
+        # 文件日志失败时仍保留控制台日志，不影响服务启动
+        print("WARNING: failed to create file logger")
+
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    logging.basicConfig(level=settings.log_level, handlers=handlers)
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
 
 UPLOAD_DIR = settings.upload_dir
 STATIC_DIR = settings.static_dir
@@ -39,17 +65,41 @@ class LocalUploadRequest(BaseModel):
     path: str
 
 
+class TranscribeRequest(BaseModel):
+    """转写请求体。"""
+
+    file_id: str
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时创建必要目录。"""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        init_db()
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logger.exception("failed to create app directories")
+        raise
     yield
 
 
 app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
 # 把 /static 路径映射到 static 目录，供浏览器加载静态资源
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """兜底捕获所有未处理异常，记录日志并返回统一 500 响应。"""
+    logger.exception(
+        "unhandled exception: method=%s path=%s",
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
+
 
 # 跨域来源由配置控制，部署到正式域名时无需改代码
 app.add_middleware(
@@ -70,6 +120,24 @@ def _safe_saved_name(original_name: str) -> str:
     return f"{uuid4().hex}_{safe_stem}{safe_extension}"
 
 
+def _reject_oversize(size: int) -> None:
+    """统一的大小限制检查，上传和本地路径登记共用。"""
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过大小限制（{settings.max_upload_size_mb}MB）",
+        )
+
+
+def _handle_media_validation_error(exc: MediaValidationError, context: str) -> None:
+    """统一处理媒体校验异常，按服务端/客户端错误区分日志级别。"""
+    if exc.status_code >= 500:
+        logger.error("media validation server error: %s error=%s", context, exc)
+    else:
+        logger.warning("media validation failed: %s error=%s", context, exc)
+    raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
 @app.get("/", include_in_schema=False)
 def index():
     """根路径返回上传页面。"""
@@ -83,7 +151,7 @@ def health():
 
 
 @app.post("/api/upload")
-def upload_file(request: Request, file: UploadFile = File(...)):
+def upload_file(request: Request, file: UploadFile = File(...)):  # noqa: B008
     """接收上传文件，校验格式和大小后保存到 uploads 目录。"""
     original_name = Path(file.filename or "unknown").name
     saved_name = _safe_saved_name(original_name)
@@ -93,15 +161,8 @@ def upload_file(request: Request, file: UploadFile = File(...)):
 
     # 根据 Content-Length 提前拒绝超大文件，避免浪费带宽
     content_length = request.headers.get("content-length")
-    if (
-        content_length
-        and content_length.isdigit()
-        and int(content_length) > MAX_UPLOAD_BYTES
-    ):
-        raise HTTPException(
-            status_code=413,
-            detail=f"文件超过大小限制（{settings.max_upload_size_mb}MB）",
-        )
+    if content_length and content_length.isdigit():
+        _reject_oversize(int(content_length))
 
     try:
         # 先读第一块做文件头检查，图片/动图尽早拦截
@@ -115,22 +176,14 @@ def upload_file(request: Request, file: UploadFile = File(...)):
             )
 
         size += len(first_chunk)
-        if size > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"文件超过大小限制（{settings.max_upload_size_mb}MB）",
-            )
+        _reject_oversize(size)
 
         # 分块写入磁盘，避免大文件一次性读入内存
         with target.open("wb") as buffer:
             buffer.write(first_chunk)
             while chunk := file.file.read(CHUNK_SIZE):
                 size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"文件超过大小限制（{settings.max_upload_size_mb}MB）",
-                    )
+                _reject_oversize(size)
                 buffer.write(chunk)
 
         # 完整落盘后，用 filetype + ffprobe 做最终校验
@@ -153,20 +206,10 @@ def upload_file(request: Request, file: UploadFile = File(...)):
         )
         raise
     except MediaValidationError as exc:
-        if exc.status_code >= 500:
-            logger.error(
-                "media validation server error: name=%s error=%s",
-                original_name,
-                exc,
-            )
-        else:
-            logger.warning(
-                "media validation failed: name=%s size=%s error=%s",
-                original_name,
-                size,
-                exc,
-            )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        _handle_media_validation_error(
+            exc,
+            f"name={original_name} size={size}",
+        )
     except Exception:
         logger.exception("unexpected upload error: name=%s", original_name)
         raise HTTPException(status_code=500, detail="服务器处理上传文件时发生错误")
@@ -174,7 +217,9 @@ def upload_file(request: Request, file: UploadFile = File(...)):
         if not saved:
             target.unlink(missing_ok=True)
 
-    logger.info("upload success: name=%s saved=%s size=%s", original_name, saved_name, size)
+    logger.info(
+        "upload success: name=%s saved=%s size=%s", original_name, saved_name, size
+    )
     return record
 
 
@@ -188,21 +233,10 @@ def upload_local_path(payload: LocalUploadRequest):
     try:
         validate_media_file(media_path, probe=settings.ffprobe_path)
     except MediaValidationError as exc:
-        if exc.status_code >= 500:
-            logger.error(
-                "local media validation server error: path=%s error=%s",
-                media_path,
-                exc,
-            )
-        else:
-            logger.warning(
-                "local media validation failed: path=%s error=%s",
-                media_path,
-                exc,
-            )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        _handle_media_validation_error(exc, f"path={media_path}")
 
     stat = media_path.stat()
+    _reject_oversize(stat.st_size)
     try:
         record = insert_file(
             original_name=media_path.name,
@@ -222,6 +256,36 @@ def upload_local_path(payload: LocalUploadRequest):
         stat.st_size,
     )
     return record
+
+
+@app.post("/api/transcribe")
+def transcribe_record(payload: TranscribeRequest):
+    """根据文件记录 ID 转写音频，返回文本和分段信息。"""
+    record = get_file(payload.file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="文件记录不存在")
+
+    media_path = Path(record["stored_path"])
+    if not media_path.is_file():
+        raise HTTPException(status_code=400, detail="文件路径已失效或文件不存在")
+
+    try:
+        result = transcribe_audio(media_path)
+    except Exception:
+        logger.exception(
+            "transcription failed: id=%s path=%s",
+            payload.file_id,
+            media_path,
+        )
+        raise HTTPException(status_code=500, detail="转写失败，请检查模型或音频文件")
+
+    result["file_id"] = payload.file_id
+    logger.info(
+        "transcription success: id=%s duration=%s",
+        payload.file_id,
+        result["duration"],
+    )
+    return result
 
 
 @app.get("/api/files")

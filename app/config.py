@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     ]
     ffprobe_path: str | None = None
     log_level: str = "INFO"
+    whisper_model_size: str = "base"
+    whisper_device: str = "cpu"
+    whisper_compute_type: str = "int8"
+    whisper_language: str = "en"
+    whisper_model_dir: Path = BASE_DIR / "models"
+    whisper_local_files_only: bool = False
+    hf_endpoint: str = "https://hf-mirror.com"
 
 
 @lru_cache

@@ -1,13 +1,17 @@
 """M1 接口自动化测试：覆盖首页、健康检查、上传与文件列表。"""
 
-from io import BytesIO
+import json
+import subprocess
 import wave
+from io import BytesIO
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.media_validation import MediaValidationError, validate_media_file
 from app.main import app
+from app.media_validation import MediaValidationError, validate_media_file
+from app.storage import init_db, insert_file
+from app.transcriber import transcribe_audio
 
 # TestClient 模拟真实 HTTP 请求，无需启动服务
 client = TestClient(app)
@@ -16,7 +20,10 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def isolate_db(tmp_path, monkeypatch):
     """每个测试使用独立的临时数据库，避免污染真实 data 目录。"""
-    monkeypatch.setattr("app.storage.DB_PATH", tmp_path / "files.db")
+    db_path = tmp_path / "files.db"
+    monkeypatch.setattr("app.storage.DB_PATH", db_path)
+    monkeypatch.setattr("app.storage._db_initialized", False)
+    init_db()
 
 
 def make_wav_bytes() -> bytes:
@@ -195,3 +202,176 @@ def test_upload_local_path_missing_returns_400(tmp_path, monkeypatch):
     )
     assert response.status_code == 400
     assert "路径" in response.json()["detail"]
+
+
+def test_transcribe_record_success(tmp_path, monkeypatch):
+    """转写接口应返回文本和分段信息。"""
+    source = tmp_path / "demo.wav"
+    source.write_bytes(make_wav_bytes())
+    record = insert_file(
+        original_name="demo.wav",
+        stored_path=source,
+        source_type="local",
+        size=len(make_wav_bytes()),
+    )
+
+    fake_result = {
+        "text": "hello world",
+        "language": "en",
+        "duration": 1.0,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "hello world"},
+        ],
+    }
+    monkeypatch.setattr("app.main.transcribe_audio", lambda path: fake_result)
+
+    response = client.post("/api/transcribe", json={"file_id": record["id"]})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["text"] == "hello world"
+    assert data["file_id"] == record["id"]
+    assert data["segments"][0]["text"] == "hello world"
+
+
+def test_transcribe_record_not_found(tmp_path, monkeypatch):
+    """不存在的文件记录应返回 404。"""
+    monkeypatch.setattr("app.main.UPLOAD_DIR", tmp_path / "uploads")
+
+    response = client.post("/api/transcribe", json={"file_id": "not-exist"})
+    assert response.status_code == 404
+
+
+def test_transcribe_missing_file_returns_400(tmp_path, monkeypatch):
+    """记录存在但文件已丢失时应返回 400。"""
+    missing_path = tmp_path / "missing.wav"
+    record = insert_file(
+        original_name="missing.wav",
+        stored_path=missing_path,
+        source_type="local",
+        size=0,
+    )
+
+    response = client.post("/api/transcribe", json={"file_id": record["id"]})
+    assert response.status_code == 400
+    assert "文件" in response.json()["detail"]
+
+
+def test_transcribe_audio_builds_result(monkeypatch):
+    """转写核心模块应把生成器结果转换为统一结构。"""
+
+    class FakeSegment:
+        id = 0
+        start = 0.0
+        end = 1.0
+        text = " hello "
+
+    class FakeInfo:
+        language = "en"
+        duration = 1.0
+
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            return iter([FakeSegment()]), FakeInfo()
+
+    monkeypatch.setattr("app.transcriber.get_model", lambda: FakeModel())
+
+    result = transcribe_audio("demo.wav")
+
+    assert result == {
+        "text": "hello",
+        "language": "en",
+        "duration": 1.0,
+        "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}],
+    }
+
+
+def test_transcribe_audio_uses_defaults_for_missing_info(monkeypatch):
+    """媒体信息缺失时，转写模块应使用默认值而不是崩溃。"""
+
+    class FakeInfo:
+        pass
+
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            return iter([]), FakeInfo()
+
+    monkeypatch.setattr("app.transcriber.get_model", lambda: FakeModel())
+
+    result = transcribe_audio("demo.wav")
+
+    assert result["text"] == ""
+    assert result["language"] == "unknown"
+    assert result["duration"] == 0.0
+    assert result["segments"] == []
+
+
+def test_validate_media_file_requires_audio_stream(tmp_path, monkeypatch):
+    """无声视频即使格式合法，也应因缺少音频流被拒绝。"""
+    media_path = tmp_path / "silent.mp4"
+    media_path.write_bytes(b"fake")
+    monkeypatch.setattr("app.media_validation.filetype.is_image", lambda _: False)
+    fake_result = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=json.dumps({"streams": [{"codec_type": "video"}]}),
+        stderr="",
+    )
+    monkeypatch.setattr(
+        "app.media_validation.subprocess.run",
+        lambda *args, **kwargs: fake_result,
+    )
+
+    with pytest.raises(MediaValidationError, match="音频"):
+        validate_media_file(media_path)
+
+
+def test_upload_local_path_rejects_oversize(tmp_path, monkeypatch):
+    """本地路径登记应复用上传的大小限制。"""
+    source = tmp_path / "big.wav"
+    source.write_bytes(make_wav_bytes())
+    monkeypatch.setattr("app.main.UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr("app.main.MAX_UPLOAD_BYTES", 10)
+
+    response = client.post("/api/upload-local", json={"path": str(source)})
+
+    assert response.status_code == 413
+
+
+def test_upload_local_path_deduplicates(tmp_path, monkeypatch):
+    """同一路径重复登记应复用已有记录，而不是产生重复文件列表项。"""
+    source = tmp_path / "demo.wav"
+    source.write_bytes(make_wav_bytes())
+    monkeypatch.setattr("app.main.UPLOAD_DIR", tmp_path / "uploads")
+
+    first = client.post("/api/upload-local", json={"path": str(source)})
+    second = client.post("/api/upload-local", json={"path": str(source)})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert len(client.get("/api/files").json()["files"]) == 1
+
+
+def test_unhandled_exception_returns_500(monkeypatch):
+    """未捕获异常应被全局处理器捕获，返回 500 而不是让服务崩溃。"""
+
+    def raise_error():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("app.main.list_stored_files", raise_error)
+    test_client = TestClient(app, raise_server_exceptions=False)
+    response = test_client.get("/api/files")
+    assert response.status_code == 500
+    assert "内部" in response.json()["detail"]
+
+
+def test_lifespan_creates_directories(tmp_path, monkeypatch):
+    """应用启动时应自动创建上传目录和静态目录。"""
+    upload_dir = tmp_path / "uploads"
+    static_dir = tmp_path / "static"
+    monkeypatch.setattr("app.main.UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr("app.main.STATIC_DIR", static_dir)
+
+    with TestClient(app):
+        assert upload_dir.is_dir()
+        assert static_dir.is_dir()

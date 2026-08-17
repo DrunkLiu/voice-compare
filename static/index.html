@@ -61,7 +61,8 @@
     }
     /* 上传结果展示区域 */
     #result,
-    #local-result {
+    #local-result,
+    #transcribe-result {
       margin-top: 16px;
       padding: 12px;
       background: #f0f4f8;
@@ -96,6 +97,8 @@
     <div id="local-result"></div>
     <h2>已上传文件</h2>
     <ul id="file-list"></ul>
+    <h2>转写结果</h2>
+    <div id="transcribe-result"></div>
   </main>
   <script>
     // 获取页面中的关键元素
@@ -106,6 +109,7 @@
     const localPathInput = document.getElementById("local-path-input");
     const localResult = document.getElementById("local-result");
     const fileList = document.getElementById("file-list");
+    const transcribeResult = document.getElementById("transcribe-result");
 
     // 监听表单提交事件，执行上传
     form.addEventListener("submit", async (event) => {
@@ -117,15 +121,7 @@
       // 上传前先给出提示
       result.textContent = "上传中...";
       try {
-        // 调用后端上传接口
-        const response = await fetch("/api/upload", { method: "POST", body: data });
-        const json = await response.json();
-        // 后端返回错误时，直接显示具体原因
-        if (!response.ok) {
-          const message = json.detail || JSON.stringify(json);
-          result.textContent = "上传失败：" + message;
-          return;
-        }
+        const json = await apiFetch("/api/upload", { method: "POST", body: data });
         // 格式化展示后端返回的文件信息
         result.textContent = JSON.stringify(json, null, 2);
         // 上传成功后刷新文件列表
@@ -142,18 +138,11 @@
       const path = localPathInput.value.trim();
       localResult.textContent = "登记中...";
       try {
-        // 调用本地路径登记接口，不复制文件
-        const response = await fetch("/api/upload-local", {
+        const json = await apiFetch("/api/upload-local", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path })
         });
-        const json = await response.json();
-        if (!response.ok) {
-          const message = json.detail || JSON.stringify(json);
-          localResult.textContent = "登记失败：" + message;
-          return;
-        }
         localResult.textContent = JSON.stringify(json, null, 2);
         loadFiles();
       } catch (error) {
@@ -161,18 +150,64 @@
       }
     });
 
+    // 统一的请求封装：解析 JSON，并把后端错误信息转成异常
+    async function apiFetch(url, options) {
+      const response = await fetch(url, options);
+      let json = {};
+      try {
+        json = await response.json();
+      } catch (error) {
+        // 非 JSON 响应时保留默认空对象，只使用 HTTP 状态码提示
+      }
+      if (!response.ok) {
+        throw new Error(json.detail || "HTTP " + response.status);
+      }
+      return json;
+    }
+
     // 从后端加载已上传文件列表并渲染到页面
     async function loadFiles() {
-      const response = await fetch("/api/files");
-      const json = await response.json();
-      // 清空旧列表，避免重复显示
-      fileList.replaceChildren();
-      json.files.forEach((file) => {
+      try {
+        const json = await apiFetch("/api/files");
+        // 清空旧列表，避免重复显示
+        fileList.replaceChildren();
+        json.files.forEach((file) => {
+          const item = document.createElement("li");
+          // 显示文件名、来源和文件大小
+          item.append(file.name + " [" + file.source_type + "] (" + file.size + " bytes) ");
+          // 每个文件提供一个转写按钮
+          const transcribeButton = document.createElement("button");
+          transcribeButton.type = "button";
+          transcribeButton.textContent = "转写";
+          transcribeButton.addEventListener("click", () => transcribeFile(file.id));
+          item.appendChild(transcribeButton);
+          fileList.appendChild(item);
+        });
+      } catch (error) {
+        // 列表加载失败时显示提示，而不是让页面静默失败
+        fileList.replaceChildren();
         const item = document.createElement("li");
-        // 显示文件名、来源和文件大小
-        item.textContent = file.name + " [" + file.source_type + "] (" + file.size + " bytes)";
+        item.textContent = "加载文件列表失败：" + error.message;
         fileList.appendChild(item);
-      });
+      }
+    }
+
+    // 调用后端转写接口并展示结果
+    async function transcribeFile(fileId) {
+      transcribeResult.textContent = "转写中，首次运行可能需要下载模型...";
+      try {
+        const json = await apiFetch("/api/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_id: fileId })
+        });
+        const segmentsText = json.segments
+          .map((segment) => "[" + segment.start + " - " + segment.end + "] " + segment.text)
+          .join("\n");
+        transcribeResult.textContent = "文本：" + json.text + "\n\n分段：\n" + segmentsText;
+      } catch (error) {
+        transcribeResult.textContent = "转写失败：" + error.message;
+      }
     }
 
     // 页面加载后立即刷新一次文件列表
