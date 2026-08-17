@@ -1,0 +1,1 @@
+"""Voice compare application package."""

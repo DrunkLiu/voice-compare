@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>语音对比 - M1</title>
+  <!-- M1 上传页面：负责选择文件、调用上传接口并展示结果 -->
+  <style>
+    /* 页面基础配色与字体 */
+    :root {
+      color-scheme: light;
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      background: #f5f7fa;
+      color: #1f2933;
+    }
+    /* 主内容卡片 */
+    main {
+      max-width: 720px;
+      margin: 48px auto;
+      padding: 24px;
+      background: #ffffff;
+      border: 1px solid #d9e2ec;
+      border-radius: 8px;
+    }
+    /* 标题样式 */
+    h1 {
+      font-size: 22px;
+      margin: 0 0 20px;
+    }
+    h2 {
+      font-size: 16px;
+      margin: 28px 0 10px;
+    }
+    /* 表单布局：文件选择框和按钮水平排列 */
+    form {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    /* 文件选择框 */
+    input[type="file"],
+    input[type="text"] {
+      flex: 1;
+      min-width: 240px;
+    }
+    /* 上传按钮 */
+    button {
+      padding: 8px 16px;
+      border: 1px solid #2680c2;
+      border-radius: 6px;
+      background: #2680c2;
+      color: #ffffff;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #1f6fb0;
+    }
+    /* 上传结果展示区域 */
+    #result,
+    #local-result {
+      margin-top: 16px;
+      padding: 12px;
+      background: #f0f4f8;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+    }
+    /* 已上传文件列表 */
+    ul {
+      margin: 0;
+      padding-left: 20px;
+    }
+    li {
+      margin: 4px 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>语音对比 - M1 上传接口</h1>
+    <form id="upload-form">
+      <input type="file" id="file-input" name="file" required>
+      <button type="submit">上传</button>
+    </form>
+    <div id="result"></div>
+    <form id="local-path-form">
+      <input type="text" id="local-path-input" placeholder="输入本地文件完整路径，例如 D:/audio/demo.wav" required>
+      <button type="submit">登记路径</button>
+    </form>
+    <div id="local-result"></div>
+    <h2>已上传文件</h2>
+    <ul id="file-list"></ul>
+  </main>
+  <script>
+    // 获取页面中的关键元素
+    const form = document.getElementById("upload-form");
+    const fileInput = document.getElementById("file-input");
+    const result = document.getElementById("result");
+    const localForm = document.getElementById("local-path-form");
+    const localPathInput = document.getElementById("local-path-input");
+    const localResult = document.getElementById("local-result");
+    const fileList = document.getElementById("file-list");
+
+    // 监听表单提交事件，执行上传
+    form.addEventListener("submit", async (event) => {
+      // 阻止浏览器默认的表单提交行为
+      event.preventDefault();
+      // 组装 FormData，并把用户选择的文件追加进去
+      const data = new FormData();
+      data.append("file", fileInput.files[0]);
+      // 上传前先给出提示
+      result.textContent = "上传中...";
+      try {
+        // 调用后端上传接口
+        const response = await fetch("/api/upload", { method: "POST", body: data });
+        const json = await response.json();
+        // 后端返回错误时，直接显示具体原因
+        if (!response.ok) {
+          const message = json.detail || JSON.stringify(json);
+          result.textContent = "上传失败：" + message;
+          return;
+        }
+        // 格式化展示后端返回的文件信息
+        result.textContent = JSON.stringify(json, null, 2);
+        // 上传成功后刷新文件列表
+        loadFiles();
+      } catch (error) {
+        result.textContent = "上传失败：" + error.message;
+      }
+    });
+
+    // 监听本地路径登记表单
+    localForm.addEventListener("submit", async (event) => {
+      // 阻止浏览器默认提交行为
+      event.preventDefault();
+      const path = localPathInput.value.trim();
+      localResult.textContent = "登记中...";
+      try {
+        // 调用本地路径登记接口，不复制文件
+        const response = await fetch("/api/upload-local", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path })
+        });
+        const json = await response.json();
+        if (!response.ok) {
+          const message = json.detail || JSON.stringify(json);
+          localResult.textContent = "登记失败：" + message;
+          return;
+        }
+        localResult.textContent = JSON.stringify(json, null, 2);
+        loadFiles();
+      } catch (error) {
+        localResult.textContent = "登记失败：" + error.message;
+      }
+    });
+
+    // 从后端加载已上传文件列表并渲染到页面
+    async function loadFiles() {
+      const response = await fetch("/api/files");
+      const json = await response.json();
+      // 清空旧列表，避免重复显示
+      fileList.replaceChildren();
+      json.files.forEach((file) => {
+        const item = document.createElement("li");
+        // 显示文件名、来源和文件大小
+        item.textContent = file.name + " [" + file.source_type + "] (" + file.size + " bytes)";
+        fileList.appendChild(item);
+      });
+    }
+
+    // 页面加载后立即刷新一次文件列表
+    loadFiles();
+  </script>
+</body>
+</html>
