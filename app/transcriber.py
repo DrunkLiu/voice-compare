@@ -15,6 +15,47 @@ logger = logging.getLogger(__name__)
 _model: WhisperModel | None = None
 _model_lock = threading.Lock()
 _inference_lock = threading.Lock()
+_MIN_WORD_DURATION = 0.01
+_WORD_EDGE_CHARS = " \t\n\r.,;:!?()[]{}\"'‘’“”…—-"
+
+
+def _clean_word_text(text: str) -> str:
+    """去掉单词首尾标点，保留内部撇号和连字符。"""
+    return text.strip().strip(_WORD_EDGE_CHARS)
+
+
+def _sanitize_word_timestamps(
+    words: list[dict],
+    segment_start: float,
+    segment_end: float,
+) -> list[dict]:
+    """清洗词级时间戳，保证时间单调且每个词有正时长。"""
+    if not words:
+        return []
+
+    result = []
+    cursor = float(segment_start)
+    for index, item in enumerate(words):
+        start = max(float(item["start"]), cursor)
+        next_start = (
+            float(words[index + 1]["start"])
+            if index + 1 < len(words)
+            else float(segment_end)
+        )
+        end = float(item["end"])
+        if end <= start:
+            end = next_start
+        if end <= start:
+            end = start + _MIN_WORD_DURATION
+        result.append(
+            {
+                **item,
+                "start": float(round(start, 3)),
+                "end": float(round(end, 3)),
+            }
+        )
+        cursor = end
+    return result
 
 
 def _load_model() -> WhisperModel:
@@ -72,17 +113,17 @@ def transcribe_audio(path: str | Path) -> dict:
         segment_list = []
         word_list = []
         for segment in segments:
-            words = []
+            raw_words = []
             for word in getattr(segment, "words", None) or []:
-                word_text = getattr(word, "word", "").strip()
+                word_text = _clean_word_text(getattr(word, "word", ""))
                 if not word_text:
                     continue
                 probability = getattr(word, "probability", None)
-                words.append(
+                raw_words.append(
                     {
                         "word": word_text,
-                        "start": float(round(word.start, 3)),
-                        "end": float(round(word.end, 3)),
+                        "start": float(getattr(word, "start", 0.0)),
+                        "end": float(getattr(word, "end", 0.0)),
                         "probability": (
                             float(round(probability, 3))
                             if probability is not None
@@ -91,6 +132,11 @@ def transcribe_audio(path: str | Path) -> dict:
                         "segment_id": segment.id,
                     }
                 )
+            words = _sanitize_word_timestamps(
+                raw_words,
+                float(segment.start),
+                float(segment.end),
+            )
             word_list.extend(words)
             segment_list.append(
                 {

@@ -19,6 +19,7 @@ from app.media_validation import (
     is_image_bytes,
     validate_media_file,
 )
+from app.schemas import TranscriptionResult
 from app.storage import get_file, init_db, insert_file
 from app.storage import list_files as list_stored_files
 from app.transcriber import transcribe_audio
@@ -258,7 +259,7 @@ def upload_local_path(payload: LocalUploadRequest):
     return record
 
 
-@app.post("/api/transcribe")
+@app.post("/api/transcribe", response_model=TranscriptionResult)
 def transcribe_record(payload: TranscribeRequest):
     """根据文件记录 ID 转写音频，返回文本和分段信息。"""
     record = get_file(payload.file_id)

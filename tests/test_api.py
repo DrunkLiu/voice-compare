@@ -1,4 +1,4 @@
-"""M1 接口自动化测试：覆盖首页、健康检查、上传与文件列表。"""
+"""M1-M3 接口自动化测试：覆盖上传、路径登记、转写和词级时间戳。"""
 
 import json
 import subprocess
@@ -11,7 +11,11 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.media_validation import MediaValidationError, validate_media_file
 from app.storage import init_db, insert_file
-from app.transcriber import transcribe_audio
+from app.transcriber import (
+    _clean_word_text,
+    _sanitize_word_timestamps,
+    transcribe_audio,
+)
 
 # TestClient 模拟真实 HTTP 请求，无需启动服务
 client = TestClient(app)
@@ -38,10 +42,10 @@ def make_wav_bytes() -> bytes:
 
 
 def test_index():
-    """首页应返回上传页面，并包含 M1 标题文字。"""
+    """首页应返回上传页面，并包含 M3 标题文字。"""
     response = client.get("/")
     assert response.status_code == 200
-    assert "M1" in response.text
+    assert "M3" in response.text
 
 
 def test_health():
@@ -359,6 +363,81 @@ def test_transcribe_audio_passes_word_timestamps(monkeypatch):
     transcribe_audio("demo.wav")
 
     assert captured["word_timestamps"] is True
+
+
+def test_transcribe_audio_can_disable_word_timestamps(monkeypatch):
+    """关闭词级时间戳时，接口结构仍应稳定并返回空 words。"""
+    captured = {}
+
+    class FakeSettings:
+        whisper_language = "en"
+        whisper_word_timestamps = False
+
+    class FakeInfo:
+        pass
+
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            captured.update(kwargs)
+            return iter([]), FakeInfo()
+
+    monkeypatch.setattr("app.transcriber.get_model", lambda: FakeModel())
+    monkeypatch.setattr("app.transcriber.get_settings", lambda: FakeSettings())
+
+    result = transcribe_audio("demo.wav")
+
+    assert captured["word_timestamps"] is False
+    assert result["words"] == []
+
+
+def test_clean_word_text_removes_edge_punctuation():
+    """单词首尾标点应被清除，内部撇号应保留。"""
+    assert _clean_word_text("hello,") == "hello"
+    assert _clean_word_text("'hello'") == "hello"
+    assert _clean_word_text("don't") == "don't"
+    assert _clean_word_text(",") == ""
+
+
+def test_sanitize_word_timestamps_fixes_zero_duration():
+    """零时长的词应被补齐为正时长，并保持时间单调。"""
+    words = [
+        {"word": "up", "start": 1.0, "end": 1.5, "segment_id": 0},
+        {"word": "and", "start": 1.5, "end": 1.5, "segment_id": 0},
+        {"word": "get", "start": 1.5, "end": 2.0, "segment_id": 0},
+    ]
+
+    result = _sanitize_word_timestamps(words, 1.0, 2.0)
+
+    assert result[1]["start"] == 1.5
+    assert result[1]["end"] > result[1]["start"]
+    assert result[2]["start"] >= result[1]["end"]
+
+
+def test_transcribe_audio_handles_segment_without_words(monkeypatch):
+    """模型不返回词级信息时，转写结果不应崩溃。"""
+
+    class FakeSegment:
+        def __init__(self):
+            self.id = 0
+            self.start = 0.0
+            self.end = 1.0
+            self.text = "hello"
+            self.words = None
+
+    class FakeInfo:
+        language = "en"
+        duration = 1.0
+
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            return iter([FakeSegment()]), FakeInfo()
+
+    monkeypatch.setattr("app.transcriber.get_model", lambda: FakeModel())
+
+    result = transcribe_audio("demo.wav")
+
+    assert result["segments"][0]["words"] == []
+    assert result["words"] == []
 
 
 def test_transcribe_audio_uses_defaults_for_missing_info(monkeypatch):
