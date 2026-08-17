@@ -66,16 +66,39 @@ def transcribe_audio(path: str | Path) -> dict:
             language=settings.whisper_language,
             beam_size=5,
             vad_filter=True,
+            word_timestamps=settings.whisper_word_timestamps,
         )
 
         segment_list = []
+        word_list = []
         for segment in segments:
+            words = []
+            for word in getattr(segment, "words", None) or []:
+                word_text = getattr(word, "word", "").strip()
+                if not word_text:
+                    continue
+                probability = getattr(word, "probability", None)
+                words.append(
+                    {
+                        "word": word_text,
+                        "start": float(round(word.start, 3)),
+                        "end": float(round(word.end, 3)),
+                        "probability": (
+                            float(round(probability, 3))
+                            if probability is not None
+                            else None
+                        ),
+                        "segment_id": segment.id,
+                    }
+                )
+            word_list.extend(words)
             segment_list.append(
                 {
                     "id": segment.id,
-                    "start": round(segment.start, 3),
-                    "end": round(segment.end, 3),
+                    "start": float(round(segment.start, 3)),
+                    "end": float(round(segment.end, 3)),
                     "text": segment.text.strip(),
+                    "words": words,
                 }
             )
 
@@ -86,6 +109,7 @@ def transcribe_audio(path: str | Path) -> dict:
     return {
         "text": "".join(item["text"] for item in segment_list).strip(),
         "language": language,
-        "duration": round(duration, 3),
+        "duration": float(round(duration, 3)),
         "segments": segment_list,
+        "words": word_list,
     }

@@ -201,10 +201,16 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ file_id: fileId })
         });
+        const wordsText = (json.words || [])
+          .map((word) => word.word + " [" + word.start + " - " + word.end + "]")
+          .join(" ");
         const segmentsText = json.segments
           .map((segment) => "[" + segment.start + " - " + segment.end + "] " + segment.text)
           .join("\n");
-        transcribeResult.textContent = "文本：" + json.text + "\n\n分段：\n" + segmentsText;
+        transcribeResult.textContent =
+          "文本：" + json.text +
+          "\n\n词级时间戳：\n" + (wordsText || "无") +
+          "\n\n分段：\n" + segmentsText;
       } catch (error) {
         transcribeResult.textContent = "转写失败：" + error.message;
       }

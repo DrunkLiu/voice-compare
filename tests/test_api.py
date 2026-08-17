@@ -220,7 +220,30 @@ def test_transcribe_record_success(tmp_path, monkeypatch):
         "language": "en",
         "duration": 1.0,
         "segments": [
-            {"id": 0, "start": 0.0, "end": 1.0, "text": "hello world"},
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "text": "hello world",
+                "words": [
+                    {
+                        "word": "hello",
+                        "start": 0.0,
+                        "end": 0.4,
+                        "probability": 0.98,
+                        "segment_id": 0,
+                    }
+                ],
+            },
+        ],
+        "words": [
+            {
+                "word": "hello",
+                "start": 0.0,
+                "end": 0.4,
+                "probability": 0.98,
+                "segment_id": 0,
+            }
         ],
     }
     monkeypatch.setattr("app.main.transcribe_audio", lambda path: fake_result)
@@ -231,6 +254,7 @@ def test_transcribe_record_success(tmp_path, monkeypatch):
     assert data["text"] == "hello world"
     assert data["file_id"] == record["id"]
     assert data["segments"][0]["text"] == "hello world"
+    assert data["words"][0]["word"] == "hello"
 
 
 def test_transcribe_record_not_found(tmp_path, monkeypatch):
@@ -259,11 +283,19 @@ def test_transcribe_missing_file_returns_400(tmp_path, monkeypatch):
 def test_transcribe_audio_builds_result(monkeypatch):
     """转写核心模块应把生成器结果转换为统一结构。"""
 
-    class FakeSegment:
-        id = 0
+    class FakeWord:
+        word = " hello "
         start = 0.0
-        end = 1.0
-        text = " hello "
+        end = 0.5
+        probability = 0.99
+
+    class FakeSegment:
+        def __init__(self):
+            self.id = 0
+            self.start = 0.0
+            self.end = 1.0
+            self.text = " hello "
+            self.words = [FakeWord()]
 
     class FakeInfo:
         language = "en"
@@ -281,8 +313,52 @@ def test_transcribe_audio_builds_result(monkeypatch):
         "text": "hello",
         "language": "en",
         "duration": 1.0,
-        "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}],
+        "segments": [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "text": "hello",
+                "words": [
+                    {
+                        "word": "hello",
+                        "start": 0.0,
+                        "end": 0.5,
+                        "probability": 0.99,
+                        "segment_id": 0,
+                    }
+                ],
+            }
+        ],
+        "words": [
+            {
+                "word": "hello",
+                "start": 0.0,
+                "end": 0.5,
+                "probability": 0.99,
+                "segment_id": 0,
+            }
+        ],
     }
+
+
+def test_transcribe_audio_passes_word_timestamps(monkeypatch):
+    """转写时应按配置开启词级时间戳。"""
+    captured = {}
+
+    class FakeInfo:
+        pass
+
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            captured.update(kwargs)
+            return iter([]), FakeInfo()
+
+    monkeypatch.setattr("app.transcriber.get_model", lambda: FakeModel())
+
+    transcribe_audio("demo.wav")
+
+    assert captured["word_timestamps"] is True
 
 
 def test_transcribe_audio_uses_defaults_for_missing_info(monkeypatch):
@@ -303,6 +379,7 @@ def test_transcribe_audio_uses_defaults_for_missing_info(monkeypatch):
     assert result["language"] == "unknown"
     assert result["duration"] == 0.0
     assert result["segments"] == []
+    assert result["words"] == []
 
 
 def test_validate_media_file_requires_audio_stream(tmp_path, monkeypatch):
